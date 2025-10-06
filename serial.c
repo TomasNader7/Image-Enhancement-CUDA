@@ -37,8 +37,8 @@ int write_ppm_from_gray(const char *filename, const unsigned char *gray_buf, int
 
 int main(int argc, char *argv[]) {
 
-    const char *input_filename  = (argc >= 2) ? argv[1] : "download.ppm";      
-    const char *output_filename = (argc >= 3) ? argv[2] : "output.ppm";
+    const char *input_filename  = (argc >= 2) ? argv[1] : "chest_x_rays.ppm";      
+    const char *output_filename = (argc >= 3) ? argv[2] : "output1.ppm";
 
     // 1. Argument parsing
     if (argc != 1 && argc != 3) {
@@ -217,15 +217,63 @@ void compute_cdf(const float pdf[256], float cdf[256]) {
     }
 }
 
-void build_map(const float cdf[256], int map[256]) {
+/* void build_map(const float cdf[256], int map[256]) {
     for (int i = 0; i < 256; i++) {
         int new_value = (int)(cdf[i] * 255 + 0.5); 
         if (new_value < 0) new_value = 0;
         if (new_value > 255) new_value = 255;
         map[i] = new_value;
     }
+} */
 
+void build_map(const float cdf[256], int map[256]) {
+    // clipping thresholds (you may tune these)
+    float lower_cut = 0.01f;   // 1%
+    float upper_cut = 0.99f;   // 99%
+
+    int floor_gray = 0;
+    for (int i = 0; i < 256; i++) {
+        if (cdf[i] >= lower_cut) {
+            floor_gray = i;
+            break;
+        }
+    }
+    int ceil_gray = 255;
+    for (int i = 255; i >= 0; i--) {
+        if (cdf[i] <= upper_cut) {
+            ceil_gray = i;
+            break;
+        }
+    }
+
+    float cdf_floor = cdf[floor_gray];
+    float cdf_ceil  = cdf[ceil_gray];
+    float denom = (cdf_ceil - cdf_floor);
+    if (denom <= 0.0f) {
+        // fallback to simple mapping if denom is zero
+        for (int i = 0; i < 256; i++) {
+            map[i] = (int)(cdf[i] * 255.0f + 0.5f);
+            if (map[i] < 0) map[i] = 0;
+            if (map[i] > 255) map[i] = 255;
+        }
+        return;
+    }
+
+    for (int i = 0; i < 256; i++) {
+        if (i < floor_gray) {
+            map[i] = 0;
+        } else if (i > ceil_gray) {
+            map[i] = 255;
+        } else {
+            float norm = (cdf[i] - cdf_floor) / denom;
+            int v = (int)(norm * 255.0f + 0.5f);
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            map[i] = v;
+        }
+    }
 }
+
 
 void apply_mapping(const unsigned char *gray_in, unsigned char *gray_out, int num_pixels, const int map[256]) {
     for (int i = 0; i < num_pixels; i++) {
