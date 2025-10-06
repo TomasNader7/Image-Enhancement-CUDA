@@ -37,7 +37,7 @@ int write_ppm_from_gray(const char *filename, const unsigned char *gray_buf, int
 
 int main(int argc, char *argv[]) {
 
-    const char *input_filename  = (argc >= 2) ? argv[1] : "download";      
+    const char *input_filename  = (argc >= 2) ? argv[1] : "download.ppm";      
     const char *output_filename = (argc >= 3) ? argv[2] : "output.ppm";
 
     // 1. Argument parsing
