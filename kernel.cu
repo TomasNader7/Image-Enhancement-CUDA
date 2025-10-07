@@ -315,32 +315,64 @@ int main(int argc, char** argv)
   printf("Running %d iterations for timing accuracy...\n\n", num_iterations);
 
 // --- SERIAL (multiple iterations for timing) ---
-double t0 = get_time_ms();
+double t0_total = get_time_ms();
 ImageGray8 eq_cpu = {0,0,NULL};
+
+double t_rgb2gray_ms = 0.0;
+double t_hist_ms     = 0.0;
+double t_cdf_map_ms  = 0.0;
+double t_apply_ms    = 0.0;
 
 for (int iter = 0; iter < num_iterations; iter++) {
     ImageGray8 gray_cpu = {0,0,NULL};
+
+    // RGB → Gray
+    double t0 = get_time_ms();
     cpu_rgb_to_gray(&rgb, &gray_cpu);
+    double t1 = get_time_ms();
+    t_rgb2gray_ms += (t1 - t0);
 
-    int   hist[256];  cpu_histogram(&gray_cpu, hist);
-    float cdf[256];   cpu_pdf_cdf(hist, rgb.w*rgb.h, cdf);
-    int   map[256];   cpu_build_map_from_cdf(cdf, map);
+    // Histogram
+    int hist[256];
+    t0 = get_time_ms();
+    cpu_histogram(&gray_cpu, hist);
+    double t2 = get_time_ms();
+    t_hist_ms += (t2 - t0);
 
-    // prevent leak: cpu_apply_map allocates out->data each call
+    // CDF + Map
+    float cdf[256];
+    int map[256];
+    t0 = get_time_ms();
+    cpu_pdf_cdf(hist, rgb.w * rgb.h, cdf);
+    cpu_build_map_from_cdf(cdf, map);
+    double t3 = get_time_ms();
+    t_cdf_map_ms += (t3 - t0);
+
+    // Apply map
     if (eq_cpu.data) { free(eq_cpu.data); eq_cpu.data = NULL; }
-
+    t0 = get_time_ms();
     cpu_apply_map(&gray_cpu, &eq_cpu, map);
+    double t4 = get_time_ms();
+    t_apply_ms += (t4 - t0);
 
     free(gray_cpu.data);
 }
 
-double t1 = get_time_ms();
-double cpu_ms = (t1 - t0) / (double)num_iterations;
+double t1_total = get_time_ms();
+double cpu_total_ms = (t1_total - t0_total);
+double cpu_avg_ms   = cpu_total_ms / num_iterations;
+
 writePPM_from_gray(out_cpu, &eq_cpu);
 
 printf("--- SERIAL RESULTS ---\n");
-printf("Total CPU time (%d iterations): %.3f ms\n", num_iterations, (t1 - t0));
-printf("Average per iteration: %.3f ms\n\n", cpu_ms);
+printf("Total CPU time (%d iterations): %.3f ms\n", num_iterations, cpu_total_ms);
+printf("Average per iteration: %.3f ms\n\n", cpu_avg_ms);
+printf("CPU stage breakdown (average per iteration):\n");
+printf("  RGB-to-Gray:         %.3f ms\n", t_rgb2gray_ms / num_iterations);
+printf("  Histogram:           %.3f ms\n", t_hist_ms / num_iterations);
+printf("  CDF+Map:             %.3f ms\n", t_cdf_map_ms / num_iterations);
+printf("  Apply Mapping:       %.3f ms\n\n", t_apply_ms / num_iterations);
+
   // PARALLEL (CUDA) - single run
   float ms_rgb2gray=0.f, ms_hist=0.f, ms_scan=0.f, ms_apply=0.f, ms_total=0.f;
   ImageGray8 eq_gpu = {0,0,NULL};
@@ -359,9 +391,9 @@ printf("Average per iteration: %.3f ms\n\n", cpu_ms);
   double diff2 = two_norm_diff(&eq_cpu, &eq_gpu);
 
   printf("--- PERFORMANCE COMPARISON ---\n");
-  printf("CPU average time (per iteration): %.3f ms\n", cpu_ms);
+  printf("CPU average time (per iteration): %.3f ms\n", cpu_avg_ms);
   printf("GPU total time:                  %.3f ms\n", ms_total);
-  printf("Speedup (CPU / GPU):             %.2f x\n", (ms_total>0.f) ? (cpu_ms/ms_total) : 0.0);
+  printf("Speedup (CPU / GPU):             %.2f x\n", (ms_total>0.f) ? (cpu_avg_ms/ms_total) : 0.0);
   printf("2-norm difference:               %.6f\n\n", diff2);
 
   if (diff2 < 0.001) {
