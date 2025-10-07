@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <time.h>
 
-
 #include <cuda_runtime.h>
 
 #define CUDA_OK(call) do { \
@@ -18,6 +17,13 @@
 } while(0)
 
 static void die(const char* msg){ fprintf(stderr, "%s\n", msg); exit(1); }
+
+// ---------- High-resolution timer ----------
+static double get_time_ms() {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000.0 + t.tv_nsec / 1e6;
+}
 
 // ---------- Minimal PPM/PGM I/O (binary P6/P5) ----------
 typedef struct  {
@@ -71,14 +77,6 @@ static ImageRGB8 readPPM(const char* path) {
   return img;
 }
 
-/* static void writePGM_from_gray(const char* path, const ImageGray8* gray){
-  FILE* f = fopen(path, "wb");
-  if(!f) die("Cannot open output file");
-  fprintf(f, "P5\n%d %d\n255\n", gray->w, gray->h);
-  fwrite(gray->data, 1, (size_t)gray->w*gray->h, f);
-  fclose(f);
-} */
-
 static void writePPM_from_gray(const char* path, const ImageGray8* gray){
   FILE* f = fopen(path, "wb");
   if(!f) die("Cannot open output PPM");
@@ -89,8 +87,6 @@ static void writePPM_from_gray(const char* path, const ImageGray8* gray){
   }
   fclose(f);
 }
-
-// --------------- CPU reference pipeline ---------------
 
 static void cpu_rgb_to_gray(const ImageRGB8* rgb, ImageGray8* gray) {
   gray->w = rgb->w; gray->h = rgb->h;
@@ -167,21 +163,6 @@ static void cpu_apply_map(const ImageGray8* in, ImageGray8* out, const int map[2
   for (size_t i=0;i<N;i++) out->data[i] = (unsigned char)map[ in->data[i] ];
 }
 
-/* static void cpu_pipeline(const ImageRGB8* in_rgb, ImageGray8* out_eq){
-  ImageGray8 gray = {0,0,NULL};
-  cpu_rgb_to_gray(in_rgb, &gray);
-
-  int hist[256]; cpu_histogram(&gray, hist);
-  float cdf[256]; cpu_pdf_cdf(hist, gray.w*gray.h, cdf);
-  int map[256]; cpu_build_map_from_cdf(cdf, map);
-
-  cpu_apply_map(&gray, out_eq, map);
-
-  free(gray.data);
-} */
-
-// ----------------- CUDA kernels -----------------
-
 __global__ void rgb_to_gray_kernel(const unsigned char* rgb, unsigned char* gray, int N){
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
   if (idx >= N) return;
@@ -207,8 +188,6 @@ __global__ void apply_map_kernel(const unsigned char* in, unsigned char* out, co
   out[idx] = (unsigned char)m;
 }
 
-// --------------- GPU pipeline wrapper (host) ---------------
-
 static void run_cuda_pipeline(const ImageRGB8* in_rgb,
                               ImageGray8* out_eq,
                               float *t_rgb2gray_ms,
@@ -220,21 +199,22 @@ static void run_cuda_pipeline(const ImageRGB8* in_rgb,
   const int W = in_rgb->w, H = in_rgb->h;
   const int N = W*H;
 
-  cudaEvent_t evStart, evA, evB, evEnd;
+  cudaEvent_t evStart, evA, evB, evC, evEnd;  
   CUDA_OK(cudaEventCreate(&evStart));
   CUDA_OK(cudaEventCreate(&evA));
   CUDA_OK(cudaEventCreate(&evB));
+  CUDA_OK(cudaEventCreate(&evC));             
   CUDA_OK(cudaEventCreate(&evEnd));
 
   unsigned char *d_rgb = NULL, *d_gray = NULL, *d_out = NULL;
   int *d_hist = NULL, *d_map = NULL;
 
-  size_t bytes_rgb  = (size_t)3*N;
-  size_t bytes_gray = (size_t)N;
+  const size_t bytes_rgb  = (size_t)3*N;
+  const size_t bytes_gray = (size_t)N;
 
   CUDA_OK(cudaMalloc((void**)&d_rgb, bytes_rgb));
   CUDA_OK(cudaMalloc((void**)&d_gray, bytes_gray));
-  CUDA_OK(cudaMalloc((void**)&d_out, bytes_gray));
+  CUDA_OK(cudaMalloc((void**)&d_out,  bytes_gray));
   CUDA_OK(cudaMalloc((void**)&d_hist, 256*sizeof(int)));
   CUDA_OK(cudaMalloc((void**)&d_map,  256*sizeof(int)));
 
@@ -244,48 +224,65 @@ static void run_cuda_pipeline(const ImageRGB8* in_rgb,
   dim3 block1d(256);
   dim3 grid1d((N + block1d.x - 1) / block1d.x);
 
+  // RGB -> Gray
   CUDA_OK(cudaEventRecord(evStart));
   rgb_to_gray_kernel<<<grid1d, block1d>>>(d_rgb, d_gray, N);
   CUDA_OK(cudaEventRecord(evA));
   CUDA_OK(cudaEventSynchronize(evA));
   CUDA_OK(cudaGetLastError());
 
+  // Histogram
   hist_kernel_atomic<<<grid1d, block1d>>>(d_gray, d_hist, N);
   CUDA_OK(cudaEventRecord(evB));
   CUDA_OK(cudaEventSynchronize(evB));
   CUDA_OK(cudaGetLastError());
 
-  int hist[256]; CUDA_OK(cudaMemcpy(hist, d_hist, sizeof(hist), cudaMemcpyDeviceToHost));
+  // Copy hist to host
+  int hist[256];
+  CUDA_OK(cudaMemcpy(hist, d_hist, sizeof(hist), cudaMemcpyDeviceToHost));
 
-  // host-side pdf+cdf+map (kept on host to match your serial logic)
-  float cdf[256]; cpu_pdf_cdf(hist, N, cdf);
-  int map[256]; cpu_build_map_from_cdf(cdf, map);
+  // ---- host-side timing for CDF + Map ----
+  double hs0 = get_time_ms();
+  float cdf[256];  cpu_pdf_cdf(hist, N, cdf);
+  int   map[256];  cpu_build_map_from_cdf(cdf, map);
+  double hs1 = get_time_ms();
+  if (t_scan_ms) *t_scan_ms = (float)(hs1 - hs0);
+  // ----------------------------------------
+
+  // Copy map H->D
   CUDA_OK(cudaMemcpy(d_map, map, sizeof(map), cudaMemcpyHostToDevice));
 
+  // Apply mapping (kernel-only timing)
+  CUDA_OK(cudaEventRecord(evC));  // start apply timing AFTER host work + H2D
   apply_map_kernel<<<grid1d, block1d>>>(d_gray, d_out, d_map, N);
   CUDA_OK(cudaEventRecord(evEnd));
   CUDA_OK(cudaEventSynchronize(evEnd));
   CUDA_OK(cudaGetLastError());
 
+  // Timings
   float ms_rgb2gray=0.f, ms_hist=0.f, ms_apply=0.f, ms_total=0.f;
-  CUDA_OK(cudaEventElapsedTime(&ms_rgb2gray, evStart, evA));
-  CUDA_OK(cudaEventElapsedTime(&ms_hist,     evA,     evB));
-  CUDA_OK(cudaEventElapsedTime(&ms_apply,    evB,     evEnd));
-  CUDA_OK(cudaEventElapsedTime(&ms_total,    evStart, evEnd));
+  CUDA_OK(cudaEventElapsedTime(&ms_rgb2gray, evStart, evA));   // rgb->gray kernel
+  CUDA_OK(cudaEventElapsedTime(&ms_hist,     evA,     evB));   // hist kernel
+  CUDA_OK(cudaEventElapsedTime(&ms_apply,    evC,     evEnd)); // apply kernel only
+  CUDA_OK(cudaEventElapsedTime(&ms_total,    evStart, evEnd)); // total kernels
 
   if (t_rgb2gray_ms) *t_rgb2gray_ms = ms_rgb2gray;
   if (t_hist_ms)     *t_hist_ms     = ms_hist;
   if (t_apply_ms)    *t_apply_ms    = ms_apply;
   if (t_total_ms)    *t_total_ms    = ms_total;
 
+  // Copy result back
   out_eq->w = W; out_eq->h = H;
   out_eq->data = (unsigned char*)malloc((size_t)N);
-  if(!out_eq->data) die("OOM out_eq");
+  if (!out_eq->data) die("OOM out_eq");
   CUDA_OK(cudaMemcpy(out_eq->data, d_out, (size_t)N, cudaMemcpyDeviceToHost));
 
-  cudaEventDestroy(evStart); cudaEventDestroy(evA);
-  cudaEventDestroy(evB); cudaEventDestroy(evEnd);
-
+  // Cleanup
+  CUDA_OK(cudaEventDestroy(evStart));
+  CUDA_OK(cudaEventDestroy(evA));
+  CUDA_OK(cudaEventDestroy(evB));
+  CUDA_OK(cudaEventDestroy(evC));
+  CUDA_OK(cudaEventDestroy(evEnd));
   cudaFree(d_rgb); cudaFree(d_gray); cudaFree(d_out);
   cudaFree(d_hist); cudaFree(d_map);
 }
@@ -310,40 +307,73 @@ int main(int argc, char** argv)
   const char* in_path  = (argc >= 2) ? argv[1] : "chest_x_rays.ppm";
   const char* out_cpu  = (argc >= 3) ? argv[2] : "output_serial.ppm";
   const char* out_gpu  = (argc >= 4) ? argv[3] : "output_cuda.ppm";
+  int num_iterations   = (argc >= 5) ? atoi(argv[4]) : 200;
 
   ImageRGB8 rgb = readPPM(in_path);
 
-  // SERIAL
-  clock_t t0 = clock();
-  ImageGray8 gray_cpu = {0,0,NULL};
-  cpu_rgb_to_gray(&rgb, &gray_cpu);
-  int hist[256]; cpu_histogram(&gray_cpu, hist);
-  float cdf[256]; cpu_pdf_cdf(hist, rgb.w*rgb.h, cdf);
-  int map[256]; cpu_build_map_from_cdf(cdf, map);
-  ImageGray8 eq_cpu = {0,0,NULL};
-  cpu_apply_map(&gray_cpu, &eq_cpu, map);
-  clock_t t1 = clock();
-  double cpu_ms = 1000.0 * (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
-  writePPM_from_gray(out_cpu, &eq_cpu);
+  printf("Image size: %d x %d (%d pixels)\n", rgb.w, rgb.h, rgb.w*rgb.h);
+  printf("Running %d iterations for timing accuracy...\n\n", num_iterations);
 
-  // PARALLEL (CUDA)
+// --- SERIAL (multiple iterations for timing) ---
+double t0 = get_time_ms();
+ImageGray8 eq_cpu = {0,0,NULL};
+
+for (int iter = 0; iter < num_iterations; iter++) {
+    ImageGray8 gray_cpu = {0,0,NULL};
+    cpu_rgb_to_gray(&rgb, &gray_cpu);
+
+    int   hist[256];  cpu_histogram(&gray_cpu, hist);
+    float cdf[256];   cpu_pdf_cdf(hist, rgb.w*rgb.h, cdf);
+    int   map[256];   cpu_build_map_from_cdf(cdf, map);
+
+    // prevent leak: cpu_apply_map allocates out->data each call
+    if (eq_cpu.data) { free(eq_cpu.data); eq_cpu.data = NULL; }
+
+    cpu_apply_map(&gray_cpu, &eq_cpu, map);
+
+    free(gray_cpu.data);
+}
+
+double t1 = get_time_ms();
+double cpu_ms = (t1 - t0) / (double)num_iterations;
+writePPM_from_gray(out_cpu, &eq_cpu);
+
+printf("--- SERIAL RESULTS ---\n");
+printf("Total CPU time (%d iterations): %.3f ms\n", num_iterations, (t1 - t0));
+printf("Average per iteration: %.3f ms\n\n", cpu_ms);
+  // PARALLEL (CUDA) - single run
   float ms_rgb2gray=0.f, ms_hist=0.f, ms_scan=0.f, ms_apply=0.f, ms_total=0.f;
   ImageGray8 eq_gpu = {0,0,NULL};
   run_cuda_pipeline(&rgb, &eq_gpu, &ms_rgb2gray, &ms_hist, &ms_scan, &ms_apply, &ms_total);
   writePPM_from_gray(out_gpu, &eq_gpu);
 
+  printf("--- PARALLEL (CUDA) RESULTS ---\n");
+  printf("GPU times (ms):\n");
+  printf("  RGB-to-Gray:           %.3f ms\n", ms_rgb2gray);
+  printf("  Histogram (atomic):    %.3f ms\n", ms_hist);
+  printf("  CDF+Map (host-side):   %.3f ms\n", ms_scan);
+  printf("  Apply mapping:         %.3f ms\n", ms_apply);
+  printf("  Total GPU time:        %.3f ms\n\n", ms_total);
+
   // Compare
   double diff2 = two_norm_diff(&eq_cpu, &eq_gpu);
 
-  printf("CPU time (ms): %.3f\n", cpu_ms);
-  printf("GPU times (ms): rgb2gray=%.3f, hist=%.3f, cdf+map(host)=%.3f, apply=%.3f, total=%.3f\n",
-         ms_rgb2gray, ms_hist, ms_scan, ms_apply, ms_total);
-  printf("Speedup (CPU total / GPU total): %.3f x\n", (ms_total>0.f)? (cpu_ms/ms_total) : 0.0);
-  printf("2-norm difference between CPU and GPU outputs: %.6f\n", diff2);
+  printf("--- PERFORMANCE COMPARISON ---\n");
+  printf("CPU average time (per iteration): %.3f ms\n", cpu_ms);
+  printf("GPU total time:                  %.3f ms\n", ms_total);
+  printf("Speedup (CPU / GPU):             %.2f x\n", (ms_total>0.f) ? (cpu_ms/ms_total) : 0.0);
+  printf("2-norm difference:               %.6f\n\n", diff2);
+
+  if (diff2 < 0.001) {
+    printf("✓ Results match: Serial and CUDA implementations are equivalent.\n");
+  } else if (diff2 < 1.0) {
+    printf("⚠ Minor differences detected (within acceptable tolerance)\n");
+  } else {
+    printf("✗ Significant differences detected. Check implementation.\n");
+  }
 
   /* cleanup */
   free(rgb.data);
-  free(gray_cpu.data);
   free(eq_cpu.data);
   free(eq_gpu.data);
 
