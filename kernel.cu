@@ -65,30 +65,39 @@
  *     6. Apply Mapping: Remap each grayscale pixel using lookup table.
  *
  * CUDA Implementation Details:
- *     - Thread organization: 1-D blocks of 256 threads, grid of ceil(N/256) blocks.
+ *     - Thread organization: 1-D blocks of 256 threads, grid size varies by kernel:
+ *         • RGB-to-Gray & Apply-Map: ceil(N/256) blocks (one thread per pixel)
+ *         • Histogram: min(ceil(N/256), 1024) blocks with grid-stride loop
+ *         • CDF/LUT: exactly 1 block of 256 threads (parallel scan in shared memory)
  *     - RGB-to-Gray kernel: Each thread processes one pixel independently (embarrassingly parallel).
- *     - Histogram kernel: Uses atomicAdd() for histogram bin updates (possible bottleneck on small images).
+ *     - Histogram kernel: Uses per-warp shared memory privatization. Each warp maintains its own
+ *                         256-bin histogram in shared memory using fast shared-memory atomics,
+ *                         then reduces to global histogram with only 256 atomics per block.
+ *     - CDF/LUT kernel: Computes PDF, performs parallel Hillis-Steele inclusive scan for CDF,
+ *                       finds 1%/99% cutoff points, and builds LUT entirely on GPU in shared memory.
  *     - Apply-Map kernel: Each thread processes one pixel via lookup table (embarrassingly parallel).
- *     - Host-side processing: PDF, CDF, and mapping computation done on CPU (only 256 values).
  *
  * Performance Notes:
  *     - Small images (< 1M pixels): Kernel launch overhead dominates; speedup ~5-15x.
- *     - Large images (> 1M pixels): Speedup increases to 100-1000x depending on GPU architecture.
- *     - Atomic histogram operations serialize updates on small datasets but scale well on large datasets.
+ *     - Large images (> 1M pixels): Speedup increases to 50-200x depending on GPU architecture.
+ *     - Per-warp histogram privatization eliminates global atomic contention bottleneck.
+ *     - Parallel CDF scan (8 iterations) much faster than sequential 256-element scan.
  *     - Two-norm difference of 0.0 confirms pixel-perfect numerical equivalence between serial and CUDA.
  *
  * Memory Management:
  *     - Input RGB image: Transferred to GPU once (host-to-device).
  *     - Grayscale intermediate: Stays on GPU to minimize PCIe transfers.
- *     - Histogram output: Transferred back to host for PDF/CDF computation.
- *     - Mapping table: Transferred to GPU for apply_map kernel.
+ *     - Histogram: Built and kept on GPU (no host transfer).
+ *     - CDF and LUT: Computed entirely on GPU in shared memory, LUT stays in GPU memory.
  *     - Final output: Transferred back to host (device-to-host).
+ *     - Total host↔device transfers: 2 (input RGB upload + output grayscale download).
  *
  * Timing Methodology:
  *     - CPU: Uses high-resolution clock_gettime(CLOCK_MONOTONIC) for nanosecond precision.
  *     - GPU: Uses CUDA events (cudaEventRecord, cudaEventElapsedTime) for kernel-specific timing.
- *     - CPU run multiple iterations (default 10-200) to overcome clock resolution limitations.
- *     - GPU run once per invocation; timing includes all kernel launches and device-host transfers.
+ *     - CPU runs multiple iterations (default 200) to overcome clock resolution limitations.
+ *     - GPU runs once per invocation; timing includes all kernel launches but excludes initial
+ *       data transfers (focuses on computational performance).
  *
  * Author: Tomas Nader
  * Student ID: w10172066
@@ -103,6 +112,15 @@
 #include <time.h>
 
 #include <cuda_runtime.h>
+
+#ifndef TPB
+#define TPB 256 // threads per block; must be multiple of 32
+#endif
+#define WARP_SIZE 32
+#define HIST_BINS 256
+
+// Padding avoids shared-memory bank conflicts on power-of-two strides
+#define SH_HIST_STRIDE (HIST_BINS + 1)
 
 #define CUDA_OK(call)                                                                       \
   do                                                                                        \
@@ -350,15 +368,45 @@ __global__ void rgb_to_gray_kernel(const unsigned char *rgb, unsigned char *gray
   gray[idx] = (unsigned char)yi;
 }
 
-__global__ void hist_kernel_atomic(const unsigned char *gray, int *hist, int N)
+__global__ void hist_kernel_shared_perwarp(const unsigned char *__restrict__ gray, int N, int *__restrict__ g_hist)
 {
-  int idx = blockDim.x * blockIdx.x + threadIdx.x;
-  if (idx >= N)
-    return;
-  unsigned char g = gray[idx];
-  atomicAdd(&hist[(int)g], 1);
-}
 
+  extern __shared__ int s_mem[]; // size: warpsPerBlock * SH_HIST_STRIDE
+  const int tid = threadIdx.x;
+  const int warp = tid / WARP_SIZE;
+
+  const int warpsPerBlock = blockDim.x / WARP_SIZE;
+
+  // 1) Zero all per-warp shared histograms
+  for (int i = tid; i < warpsPerBlock * SH_HIST_STRIDE; i += blockDim.x)
+  {
+    s_mem[i] = 0;
+  }
+  __syncthreads();
+
+  // 2) Accumulate into this block's per-warp histograms (grid-stride loop)
+  for (int idx = blockIdx.x * blockDim.x + tid;
+       idx < N;
+       idx += blockDim.x * gridDim.x)
+  {
+    unsigned char g = gray[idx];
+    int *warp_hist = s_mem + warp * SH_HIST_STRIDE;
+    atomicAdd(&warp_hist[(int)g], 1); // shared-memory atomic (fast)
+  }
+  __syncthreads();
+
+  // 3) Reduce per-warp histograms into the global histogram
+  for (int bin = tid; bin < HIST_BINS; bin += blockDim.x)
+  {
+    int sum = 0;
+    for (int w = 0; w < warpsPerBlock; ++w)
+    {
+      sum += s_mem[w * SH_HIST_STRIDE + bin];
+    }
+    if (sum)
+      atomicAdd(&g_hist[bin], sum);
+  }
+}
 __global__ void apply_map_kernel(const unsigned char *in, unsigned char *out, const int *map, int N)
 {
   int idx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -367,6 +415,117 @@ __global__ void apply_map_kernel(const unsigned char *in, unsigned char *out, co
   unsigned char t = in[idx];
   int m = map[(int)t];
   out[idx] = (unsigned char)m;
+}
+
+// Build CDF and LUT on device from a 256-bin histogram.
+__global__ void cdf_and_lut_kernel(const int *__restrict__ hist,
+                                   int N,
+                                   int *__restrict__ d_map)
+{
+  // Shared array holds PDF/CDF (float[256]).
+  extern __shared__ float cdf[]; // size = 256 * sizeof(float)
+
+  const int tid = threadIdx.x;
+  if (blockIdx.x != 0 || blockDim.x < 256)
+    return;
+  if (N <= 0)
+  {
+    if (tid < 256)
+      d_map[tid] = tid; // identity map
+    return;
+  }
+
+  // 1) Load PDF into shared memory
+  if (tid < 256)
+  {
+    float invN = 1.0f / (float)N;
+    cdf[tid] = (float)hist[tid] * invN;
+  }
+  __syncthreads();
+
+  for (int offset = 1; offset < 256; offset <<= 1)
+  {
+    float addend = 0.0f;
+    if (tid >= offset && tid < 256)
+    {
+      addend = cdf[tid - offset];
+    }
+    __syncthreads();
+    if (tid < 256)
+    {
+      cdf[tid] += addend;
+    }
+    __syncthreads();
+  }
+
+  // 3) Find 1% and 99% cut points; compute fallback flag.
+  __shared__ int floor_gray;
+  __shared__ int ceil_gray;
+  __shared__ float cdf_floor;
+  __shared__ float cdf_ceil;
+  __shared__ int use_plain;
+
+  if (tid == 0)
+  {
+    const float lower_cut = 0.01f;
+    const float upper_cut = 0.99f;
+
+    int f = 0;
+    while (f < 256 && cdf[f] < lower_cut)
+      ++f;
+
+    int c = 255;
+    while (c >= 0 && cdf[c] > upper_cut)
+      --c;
+
+    floor_gray = (f < 256) ? f : 0;
+    ceil_gray = (c >= 0) ? c : 255;
+
+    cdf_floor = cdf[floor_gray];
+    cdf_ceil = cdf[ceil_gray];
+
+    use_plain = ((cdf_ceil - cdf_floor) <= 0.0f) ? 1 : 0; // fallback if no range
+  }
+  __syncthreads();
+
+  // 4) Build LUT directly to device memory (d_map)
+  if (tid < 256)
+  {
+    int out;
+    if (use_plain)
+    {
+      // Plain equalization: round(255 * CDF)
+      int v = (int)floorf(255.0f * cdf[tid] + 0.5f);
+      if (v < 0)
+        v = 0;
+      if (v > 255)
+        v = 255;
+      out = v;
+    }
+    else
+    {
+      if (tid < floor_gray)
+      {
+        out = 0;
+      }
+      else if (tid > ceil_gray)
+      {
+        out = 255;
+      }
+      else
+      {
+        float denom = cdf_ceil - cdf_floor;
+        float norm = (cdf[tid] - cdf_floor) / denom;
+        int v = (int)floorf(255.0f * norm + 0.5f);
+        if (v < 0)
+          v = 0;
+        if (v > 255)
+          v = 255;
+        out = v;
+      }
+    }
+    d_map[tid] = out;
+  }
 }
 
 // --------------- GPU pipeline wrapper (host) --------------
@@ -404,7 +563,7 @@ static void run_cuda_pipeline(const ImageRGB8 *in_rgb,
   CUDA_OK(cudaMemcpy(d_rgb, in_rgb->data, bytes_rgb, cudaMemcpyHostToDevice));
   CUDA_OK(cudaMemset(d_hist, 0, 256 * sizeof(int)));
 
-  dim3 block1d(256);
+  dim3 block1d(TPB);
   dim3 grid1d((N + block1d.x - 1) / block1d.x);
 
   // RGB -> Gray
@@ -414,29 +573,44 @@ static void run_cuda_pipeline(const ImageRGB8 *in_rgb,
   CUDA_OK(cudaEventSynchronize(evA));
   CUDA_OK(cudaGetLastError());
 
-  // Histogram
-  hist_kernel_atomic<<<grid1d, block1d>>>(d_gray, d_hist, N);
+  // Histogram (per-warp shared-memory privatization)
+  CUDA_OK(cudaMemset(d_hist, 0, 256 * sizeof(int))); // ensure global hist is zeroed
+
+  int grid_hist_blocks = (N + block1d.x - 1) / block1d.x;
+  if (grid_hist_blocks > 1024)
+    grid_hist_blocks = 1024; // Cap at 1024 blocks
+  dim3 grid_hist(grid_hist_blocks);
+
+  int warpsPerBlock = block1d.x / WARP_SIZE;
+  size_t shmemBytes = (size_t)warpsPerBlock * SH_HIST_STRIDE * sizeof(int);
+
+  hist_kernel_shared_perwarp<<<grid_hist, block1d, shmemBytes>>>(d_gray, N, d_hist);
   CUDA_OK(cudaEventRecord(evB));
   CUDA_OK(cudaEventSynchronize(evB));
   CUDA_OK(cudaGetLastError());
 
-  // Copy hist to host
-  int hist[256];
-  CUDA_OK(cudaMemcpy(hist, d_hist, sizeof(hist), cudaMemcpyDeviceToHost));
+  // ---- GPU CDF + LUT (device-side) ----
+  cudaEvent_t evScanEnd;
+  CUDA_OK(cudaEventCreate(&evScanEnd));
 
-  // ---- host-side timing for CDF + Map ----
-  double hs0 = get_time_ms();
-  float cdf[256];
-  cpu_pdf_cdf(hist, N, cdf);
-  int map[256];
-  cpu_build_map_from_cdf(cdf, map);
-  double hs1 = get_time_ms();
+  // Build CDF and LUT on device from the 256-bin histogram
+  // Launch with a single block of 256 threads and 256*sizeof(float) shared memory.
+  cdf_and_lut_kernel<<<1, 256, 256 * sizeof(float)>>>(d_hist, N, d_map);
+
+  // Record end of the "CDF+Map" phase
+  CUDA_OK(cudaEventRecord(evScanEnd));
+  CUDA_OK(cudaEventSynchronize(evScanEnd));
+  CUDA_OK(cudaGetLastError());
+
+  // Store "CDF+Map" GPU time
   if (t_scan_ms)
-    *t_scan_ms = (float)(hs1 - hs0);
-  // ----------------------------------------
-
-  // Copy map H->D
-  CUDA_OK(cudaMemcpy(d_map, map, sizeof(map), cudaMemcpyHostToDevice));
+  {
+    float ms_scan = 0.f;
+    CUDA_OK(cudaEventElapsedTime(&ms_scan, evB, evScanEnd));
+    *t_scan_ms = ms_scan;
+  }
+  CUDA_OK(cudaEventDestroy(evScanEnd));
+  // ---- end GPU CDF + LUT ----
 
   // Apply mapping (kernel-only timing)
   CUDA_OK(cudaEventRecord(evC)); // start apply timing AFTER host work + H2D
@@ -585,8 +759,8 @@ int main(int argc, char **argv)
   printf("--- PARALLEL (CUDA) RESULTS ---\n");
   printf("GPU times (ms):\n");
   printf("  RGB-to-Gray:           %.3f ms\n", ms_rgb2gray);
-  printf("  Histogram (atomic):    %.3f ms\n", ms_hist);
-  printf("  CDF+Map (host-side):   %.3f ms\n", ms_scan);
+  printf("  Histogram (shared-per-warp): %.3f ms\n", ms_hist);
+  printf("  CDF+Map (device-side): %.3f ms\n", ms_scan);
   printf("  Apply mapping:         %.3f ms\n", ms_apply);
   printf("  Total GPU time:        %.3f ms\n\n", ms_total);
 
